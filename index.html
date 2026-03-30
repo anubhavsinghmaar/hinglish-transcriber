@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Podcast Transcription Studio</title>
+  <meta
+    name="description"
+    content="Upload a podcast audio file and generate a structured Hindi transcript with a Hinglish version."
+  />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&amp;family=Playfair+Display:wght@500;600;700&amp;display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="studio-shell">
+    <header class="studio-header section-appear delay-1">
+      <div>
+        <p class="eyebrow">Podcast transcription studio</p>
+        <h1>Your words, carefully shaped</h1>
+      </div>
+      <button id="settingsBtn" class="ghost-btn" type="button">Studio keys</button>
+    </header>
+
+    <main>
+      <section id="uploadCard" class="studio-card upload-card section-appear delay-2">
+        <h2>Bring your conversation here</h2>
+        <p class="lead-copy">Drop your audio file or choose from your device</p>
+
+        <div id="dropZone" class="drop-zone" role="button" aria-label="Upload audio file" tabindex="0">
+          <input type="file" id="fileInput" accept=".mp3,audio/mpeg" class="file-input-overlay" />
+          <div class="upload-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 16V5m0 0l-4 4m4-4l4 4" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M5 16.75v1.5A1.75 1.75 0 006.75 20h10.5A1.75 1.75 0 0019 18.25v-1.5" />
+            </svg>
+          </div>
+          <p class="drop-title">Bring your conversation here</p>
+          <p class="drop-subtitle">Drop your audio file or choose from your device</p>
+        </div>
+
+        <div id="fileInfo" class="file-row hidden">
+          <div class="file-meta">
+            <p id="fileName"></p>
+            <p id="fileSize" class="file-size"></p>
+          </div>
+          <button id="removeFileBtn" type="button" class="text-btn">Remove</button>
+        </div>
+
+        <button id="processBtn" type="button" class="primary-btn" disabled>
+          Begin transcription
+        </button>
+      </section>
+
+      <section id="statusCard" class="studio-card process-card hidden section-appear delay-3">
+        <p class="process-intro">This is where your words take shape</p>
+        <div class="status-row">
+          <span id="statusSpinner" class="status-icon" aria-hidden="true">
+            <svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="9" opacity="0.35"></circle>
+              <path d="M21 12a9 9 0 00-9-9" stroke-linecap="round"></path>
+            </svg>
+          </span>
+          <span id="statusCheck" class="status-icon hidden" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 8" />
+            </svg>
+          </span>
+          <span id="statusError" class="status-icon hidden" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="9"></circle>
+              <path stroke-linecap="round" d="M12 8v5" />
+              <circle cx="12" cy="16.5" r="0.6" fill="currentColor" stroke="none"></circle>
+            </svg>
+          </span>
+          <p id="statusText">We are listening</p>
+        </div>
+
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div id="progressBar" class="progress-fill" style="width: 0%"></div>
+        </div>
+
+        <div class="process-steps" aria-live="polite">
+          <div id="step1" class="process-step">Preparing the audio</div>
+          <div id="step2" class="process-step">Understanding the conversation</div>
+          <div id="step3" class="process-step">Writing the transcript</div>
+          <div id="step4" class="process-step">Shaping it into Hinglish</div>
+        </div>
+      </section>
+
+      <section id="errorCard" class="error-card hidden section-appear delay-2" role="alert">
+        <p class="error-title">We hit a pause</p>
+        <p id="errorText"></p>
+      </section>
+
+      <section id="outputCard" class="output-grid hidden section-appear delay-4">
+        <article class="transcript-panel panel-original">
+          <div class="panel-head">
+            <div>
+              <p class="panel-label">Original conversation</p>
+              <h3>Hindi transcript</h3>
+            </div>
+            <button id="copyDgBtn" type="button" class="copy-btn">
+              <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 9.5A1.5 1.5 0 0110.5 8h8A1.5 1.5 0 0120 9.5v8a1.5 1.5 0 01-1.5 1.5h-8A1.5 1.5 0 019 17.5v-8z" />
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 15V6.5A1.5 1.5 0 017.5 5H16" />
+              </svg>
+              <svg class="copied-icon hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 8" />
+              </svg>
+              <span class="copy-label">Copy</span>
+            </button>
+          </div>
+          <div class="transcript-body">
+            <textarea id="deepgramArea" readonly placeholder="The original transcript will appear here."></textarea>
+          </div>
+        </article>
+
+        <article class="transcript-panel panel-hinglish">
+          <div class="panel-head">
+            <div>
+              <p class="panel-label">Hinglish version</p>
+              <h3>Romanized transcript</h3>
+            </div>
+            <button id="copyGmBtn" type="button" class="copy-btn">
+              <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 9.5A1.5 1.5 0 0110.5 8h8A1.5 1.5 0 0120 9.5v8a1.5 1.5 0 01-1.5 1.5h-8A1.5 1.5 0 019 17.5v-8z" />
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 15V6.5A1.5 1.5 0 017.5 5H16" />
+              </svg>
+              <svg class="copied-icon hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 8" />
+              </svg>
+              <span class="copy-label">Copy</span>
+            </button>
+          </div>
+          <div class="transcript-body">
+            <textarea id="outputArea" readonly placeholder="Your Hinglish transcript will appear here."></textarea>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <div id="settingsModal" class="modal-overlay hidden" style="display: none">
+    <div class="modal-card section-appear delay-1">
+      <div class="modal-head">
+        <h3>Studio keys</h3>
+        <button id="closeModalBtn" type="button" class="icon-btn" aria-label="Close settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 6l12 12M18 6l-12 12" />
+          </svg>
+        </button>
+      </div>
+      <p class="modal-copy">Your keys stay in your browser storage and never leave your machine.</p>
+
+      <div class="field-row">
+        <label for="deepgramKeyInput">Deepgram API key</label>
+        <div class="field-wrap">
+          <input id="deepgramKeyInput" type="password" placeholder="Paste key" />
+          <button onclick="toggleVisibility('deepgramKeyInput', this)" class="icon-btn" type="button" aria-label="Toggle key visibility">
+            <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <svg class="eye-closed hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 3l18 18" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.58 10.58A2 2 0 0012 14a2 2 0 001.42-.58" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6.71 6.7C4.53 8.06 3.13 10.1 2.5 12c1.3 3.83 4.9 6 9.5 6a10 10 0 004.35-.95" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9.87 5.22A10.6 10.6 0 0112 5c6 0 9.5 7 9.5 7a13.4 13.4 0 01-1.67 2.5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label for="cloudConvertKeyInput">CloudConvert API key (optional)</label>
+        <div class="field-wrap">
+          <input id="cloudConvertKeyInput" type="password" placeholder="Paste key" />
+          <button onclick="toggleVisibility('cloudConvertKeyInput', this)" class="icon-btn" type="button" aria-label="Toggle key visibility">
+            <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <svg class="eye-closed hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 3l18 18" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.58 10.58A2 2 0 0012 14a2 2 0 001.42-.58" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6.71 6.7C4.53 8.06 3.13 10.1 2.5 12c1.3 3.83 4.9 6 9.5 6a10 10 0 004.35-.95" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9.87 5.22A10.6 10.6 0 0112 5c6 0 9.5 7 9.5 7a13.4 13.4 0 01-1.67 2.5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label for="geminiKeyInput">Gemini API key</label>
+        <div class="field-wrap">
+          <input id="geminiKeyInput" type="password" placeholder="Paste key" />
+          <button onclick="toggleVisibility('geminiKeyInput', this)" class="icon-btn" type="button" aria-label="Toggle key visibility">
+            <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <svg class="eye-closed hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 3l18 18" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.58 10.58A2 2 0 0012 14a2 2 0 001.42-.58" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6.71 6.7C4.53 8.06 3.13 10.1 2.5 12c1.3 3.83 4.9 6 9.5 6a10 10 0 004.35-.95" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9.87 5.22A10.6 10.6 0 0112 5c6 0 9.5 7 9.5 7a13.4 13.4 0 01-1.67 2.5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <p id="saveStatus" class="save-status hidden">Keys saved</p>
+      <button id="saveKeysBtn" type="button" class="primary-btn modal-btn">Save keys</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
