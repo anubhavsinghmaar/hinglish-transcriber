@@ -470,7 +470,7 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
       ],
     };
 
-    const GEMINI_MODEL = "gemini-3-flash-preview";
+    const GEMINI_MODEL = "gemini-3.5-flash";
     const MAX_RETRIES = 3;
     let gmData = null;
 
