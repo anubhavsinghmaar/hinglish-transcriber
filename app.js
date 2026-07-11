@@ -389,7 +389,7 @@ processBtn.addEventListener("click", async () => {
     showStatus("Understanding the conversation…", 40, stepIndex);
 
     const dgResponse = await fetch(
-      "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true",
+      "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true",
       {
         method: "POST",
         headers: {
