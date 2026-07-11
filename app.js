@@ -542,10 +542,25 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
       );
     }
 
-    const hinglishText =
-      gmData?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const candidate = gmData?.candidates?.[0];
+    const hinglishText = (candidate?.content?.parts || [])
+      .map((p) => p.text)
+      .filter(Boolean)
+      .join("")
+      .trim();
 
     if (!hinglishText) {
+      const finishReason = candidate?.finishReason;
+      if (finishReason === "MAX_TOKENS") {
+        throw new Error(
+          "The transcript was too long for Gemini to process in a single pass. Please try a shorter audio file."
+        );
+      }
+      if (finishReason && finishReason !== "STOP") {
+        throw new Error(
+          `Gemini stopped without returning any text (reason: ${finishReason}). Please try again.`
+        );
+      }
       throw new Error(
         "Gemini returned an empty or unexpected response. Please check your API key and try again."
       );
