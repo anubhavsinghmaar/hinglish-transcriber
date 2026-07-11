@@ -482,10 +482,13 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       const gmResponse = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": geminiKey,
+          },
           body: JSON.stringify(geminiPayload),
         }
       );
