@@ -164,6 +164,8 @@ function handleFile(file) {
     return;
   }
   selectedFile = file;
+  deepgramArea.value = "";
+  outputArea.value = "";
   fileName.textContent = file.name;
   fileSize.textContent = formatBytes(file.size);
   fileInfo.classList.remove("hidden");
@@ -178,6 +180,8 @@ function clearFile() {
   fileInfo.classList.add("hidden");
   fileInfo.classList.remove("flex");
   processBtn.disabled = true;
+  deepgramArea.value = "";
+  outputArea.value = "";
 }
 
 fileInput.addEventListener("change", (e) => handleFile(e.target.files[0]));
@@ -219,6 +223,8 @@ function resetStatus() {
   statusSpinner.classList.add("hidden");
   statusCheck.classList.add("hidden");
   statusError.classList.add("hidden");
+  deepgramArea.value = "";
+  outputArea.value = "";
 }
 
 function showStatus(msg, percent, currentStep) {
@@ -383,7 +389,7 @@ processBtn.addEventListener("click", async () => {
     showStatus("Understanding the conversation…", 40, stepIndex);
 
     const dgResponse = await fetch(
-      "https://api.deepgram.com/v1/listen?model=nova-3&language=hi&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true",
+      "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true",
       {
         method: "POST",
         headers: {
@@ -476,10 +482,13 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       const gmResponse = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": geminiKey,
+          },
           body: JSON.stringify(geminiPayload),
         }
       );
@@ -536,10 +545,25 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
       );
     }
 
-    const hinglishText =
-      gmData?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const candidate = gmData?.candidates?.[0];
+    const hinglishText = (candidate?.content?.parts || [])
+      .map((p) => p.text)
+      .filter(Boolean)
+      .join("")
+      .trim();
 
     if (!hinglishText) {
+      const finishReason = candidate?.finishReason;
+      if (finishReason === "MAX_TOKENS") {
+        throw new Error(
+          "The transcript was too long for Gemini to process in a single pass. Please try a shorter audio file."
+        );
+      }
+      if (finishReason && finishReason !== "STOP") {
+        throw new Error(
+          `Gemini stopped without returning any text (reason: ${finishReason}). Please try again.`
+        );
+      }
       throw new Error(
         "Gemini returned an empty or unexpected response. Please check your API key and try again."
       );
