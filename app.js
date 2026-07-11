@@ -164,6 +164,8 @@ function handleFile(file) {
     return;
   }
   selectedFile = file;
+  deepgramArea.value = "";
+  outputArea.value = "";
   fileName.textContent = file.name;
   fileSize.textContent = formatBytes(file.size);
   fileInfo.classList.remove("hidden");
@@ -178,6 +180,8 @@ function clearFile() {
   fileInfo.classList.add("hidden");
   fileInfo.classList.remove("flex");
   processBtn.disabled = true;
+  deepgramArea.value = "";
+  outputArea.value = "";
 }
 
 fileInput.addEventListener("change", (e) => handleFile(e.target.files[0]));
@@ -219,6 +223,8 @@ function resetStatus() {
   statusSpinner.classList.add("hidden");
   statusCheck.classList.add("hidden");
   statusError.classList.add("hidden");
+  deepgramArea.value = "";
+  outputArea.value = "";
 }
 
 function showStatus(msg, percent, currentStep) {
