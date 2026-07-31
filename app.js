@@ -287,6 +287,471 @@ function setupCopyBtn(btn, textarea) {
 setupCopyBtn(copyDgBtn, deepgramArea);
 setupCopyBtn(copyGmBtn, outputArea);
 
+// ── Network helper ──
+// fetch() rejects with a bare "Failed to fetch" that names no service, which makes
+// a dropped connection impossible to attribute. Wrap every call so the error says
+// which API broke.
+async function fetchOr(label, url, opts) {
+  try {
+    return await fetch(url, opts);
+  } catch (err) {
+    if (err?.name === "AbortError") throw err;
+    throw new Error(
+      `Could not reach ${label}. Check your internet connection, or whether a browser extension or proxy is blocking the request. (${err.message})`
+    );
+  }
+}
+
+// ── MP3 frame parsing (ISO/IEC 11172-3 + 13818-3) ──
+// Used to cut a large mp3 into smaller valid mp3s WITHOUT decoding it. Decoding a
+// 3-hour file via decodeAudioData would allocate gigabytes of Float32 PCM and kill
+// the tab; slicing at frame boundaries is a pure byte operation.
+const MPEG_V25 = 0, MPEG_RESERVED = 1, MPEG_V2 = 2, MPEG_V1 = 3;
+const LAYER_RESERVED = 0, LAYER_III = 1, LAYER_II = 2, LAYER_I = 3;
+
+const MP3_BITRATE = [];
+MP3_BITRATE[MPEG_V1] = [];
+MP3_BITRATE[MPEG_V1][LAYER_I] = [0,32,64,96,128,160,192,224,256,288,320,352,384,416,448,-1];
+MP3_BITRATE[MPEG_V1][LAYER_II] = [0,32,48,56,64,80,96,112,128,160,192,224,256,320,384,-1];
+MP3_BITRATE[MPEG_V1][LAYER_III] = [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,-1];
+MP3_BITRATE[MPEG_V2] = [];
+MP3_BITRATE[MPEG_V2][LAYER_I] = [0,32,48,56,64,80,96,112,128,144,160,176,192,224,256,-1];
+MP3_BITRATE[MPEG_V2][LAYER_II] = [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,-1];
+MP3_BITRATE[MPEG_V2][LAYER_III] = MP3_BITRATE[MPEG_V2][LAYER_II];
+MP3_BITRATE[MPEG_V25] = MP3_BITRATE[MPEG_V2];
+
+const MP3_SRATE = [];
+MP3_SRATE[MPEG_V1] = [44100, 48000, 32000];
+MP3_SRATE[MPEG_V2] = [22050, 24000, 16000];
+MP3_SRATE[MPEG_V25] = [11025, 12000, 8000];
+
+function parseFrameHeader(u8, p) {
+  if (p + 4 > u8.length) return null;
+  const b2 = u8[p + 1], b3 = u8[p + 2], b4 = u8[p + 3];
+  if (u8[p] !== 0xff || (b2 & 0xe0) !== 0xe0) return null; // 11-bit frame sync
+
+  const version = (b2 >> 3) & 3, layer = (b2 >> 1) & 3;
+  if (version === MPEG_RESERVED || layer === LAYER_RESERVED) return null;
+
+  const bIdx = (b3 >> 4) & 15, sIdx = (b3 >> 2) & 3, padding = (b3 >> 1) & 1;
+  if (bIdx === 0 || bIdx === 15 || sIdx === 3) return null; // free / bad / reserved
+
+  const kbps = MP3_BITRATE[version][layer][bIdx], sampleRate = MP3_SRATE[version][sIdx];
+  if (!kbps || kbps < 0 || !sampleRate) return null;
+  const bitrate = kbps * 1000;
+
+  const spf = layer === LAYER_I ? 384
+    : layer === LAYER_II ? 1152
+    : (version === MPEG_V1 ? 1152 : 576);
+
+  const frameLength = layer === LAYER_I
+    ? (Math.floor(12 * bitrate / sampleRate) + padding) * 4
+    : Math.floor(spf / 8 * bitrate / sampleRate) + padding;
+  if (frameLength < 21) return null;
+
+  return {
+    frameLength, version, layer, sampleRate, samplesPerFrame: spf,
+    channelMode: (b4 >> 6) & 3, durationSec: spf / sampleRate,
+  };
+}
+
+// ID3v2 tag at the head: "ID3", flags byte 5 (0x10 = v2.4 footer), synchsafe size 6..9
+function id3v2Size(u8) {
+  if (u8.length < 10) return 0;
+  if (u8[0] !== 0x49 || u8[1] !== 0x44 || u8[2] !== 0x33) return 0;
+  if (u8[3] >= 0xff || u8[4] === 0xff) return 0;
+  if ((u8[6] | u8[7] | u8[8] | u8[9]) & 0x80) return 0;
+  return 10 + ((u8[6] << 21) | (u8[7] << 14) | (u8[8] << 7) | u8[9]) + ((u8[5] & 0x10) ? 10 : 0);
+}
+
+// Xing / Info / VBRI ghost frame — metadata only, decodes to silence. Skip it.
+function isXingFrame(u8, p, hdr) {
+  if (p + 40 <= u8.length &&
+      u8[p+36] === 0x56 && u8[p+37] === 0x42 && u8[p+38] === 0x52 && u8[p+39] === 0x49) return true;
+  const mono = hdr.channelMode === 3;
+  const sideInfo = hdr.version === MPEG_V1 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+  const q = p + 4 + sideInfo;
+  if (q + 4 > u8.length) return false;
+  const a = u8[q], b = u8[q+1], c = u8[q+2], d = u8[q+3];
+  return (a === 0x58 && b === 0x69 && c === 0x6e && d === 0x67)  // "Xing"
+      || (a === 0x49 && b === 0x6e && c === 0x66 && d === 0x6f); // "Info"
+}
+
+// Stream the file, index every frame, then cut on frame boundaries. Each chunk is a
+// standalone mp3. A small overlap lets the merge step re-anchor speaker identity.
+const FRAME_CARRY = 1 << 16;
+
+async function splitMp3ByFrames(file, {
+  maxBytes = 40 * 1024 * 1024, maxSeconds = 600, overlapSeconds = 8, onProgress = null,
+} = {}) {
+  let cap = 1 << 16, n = 0;
+  let offsets = new Float64Array(cap), times = new Float64Array(cap);
+  const push = (off, t) => {
+    if (n === cap) {
+      cap *= 2;
+      const o = new Float64Array(cap); o.set(offsets); offsets = o;
+      const s = new Float64Array(cap); s.set(times); times = s;
+    }
+    offsets[n] = off; times[n] = t; n++;
+  };
+
+  const reader = file.stream().getReader();
+  let carry = new Uint8Array(0), carryBase = 0;
+  let cursor = 0, lastFrameEnd = 0, elapsed = 0;
+  let started = false, eof = false;
+
+  while (!eof) {
+    const { value, done } = await reader.read();
+    eof = done;
+    if (value?.length) {
+      const m = new Uint8Array(carry.length + value.length);
+      m.set(carry, 0); m.set(value, carry.length); carry = m;
+    }
+    if (!carry.length) break;
+    if (!started) { cursor = Math.max(cursor, carryBase + id3v2Size(carry)); started = true; }
+
+    for (;;) {
+      const rel = cursor - carryBase;
+      if (rel < 0) { cursor = carryBase; continue; }
+      if (rel + 4 > carry.length) break;
+
+      const midTag = id3v2Size(carry.subarray(rel)); // mid-stream tag in stitched files
+      if (midTag > 0) {
+        if (rel + midTag > carry.length && !eof) break;
+        cursor += midTag; continue;
+      }
+
+      const hdr = parseFrameHeader(carry, rel);
+      if (!hdr) { // resync: scan for a sync word confirmed by the following frame
+        let found = -1;
+        for (let i = rel; i <= carry.length - 4; i++) {
+          if (carry[i] !== 0xff) continue;
+          const h = parseFrameHeader(carry, i);
+          if (!h) continue;
+          const nx = i + h.frameLength;
+          if (nx + 4 <= carry.length) {
+            const h2 = parseFrameHeader(carry, nx);
+            if (!h2 || h2.sampleRate !== h.sampleRate || h2.layer !== h.layer) continue;
+          } else if (!eof) break;
+          found = i; break;
+        }
+        if (found < 0) { cursor = Math.max(cursor, carryBase + carry.length - 3); break; }
+        cursor = carryBase + found; continue;
+      }
+      if (rel + hdr.frameLength > carry.length) {
+        if (eof) cursor = carryBase + carry.length;
+        break;
+      }
+      if (isXingFrame(carry, rel, hdr)) {
+        cursor += hdr.frameLength; lastFrameEnd = cursor; continue;
+      }
+
+      push(cursor, elapsed);
+      elapsed += hdr.durationSec;
+      cursor += hdr.frameLength;
+      lastFrameEnd = cursor;
+    }
+
+    const keepFrom = Math.max(0, cursor - carryBase - FRAME_CARRY);
+    if (keepFrom > 0) { carry = carry.slice(keepFrom); carryBase += keepFrom; }
+    onProgress?.(Math.min(1, cursor / file.size));
+  }
+  reader.releaseLock?.();
+  if (n === 0) throw new Error("No MPEG audio frames found — this does not look like a usable MP3.");
+  push(lastFrameEnd, elapsed); // sentinel, excludes trailing ID3v1/APEv2 junk
+
+  const chunks = [];
+  let i = 0;
+  const last = n - 1;
+  while (i < last) {
+    let j = i + 1;
+    while (j < last && offsets[j+1] - offsets[i] <= maxBytes
+                    && times[j+1] - times[i] <= maxSeconds) j++;
+    let head = i;
+    if (overlapSeconds > 0 && i > 0) {
+      const target = times[i] - overlapSeconds;
+      while (head > 0 && times[head-1] >= target) head--;
+    }
+    chunks.push({
+      index: chunks.length,
+      blob: file.slice(offsets[head], offsets[j], "audio/mpeg"), // lazy view, no copy
+      byteStart: offsets[head], byteEnd: offsets[j],
+      offsetSec: times[head],        // add to every Deepgram timestamp
+      contentStartSec: times[i],     // where non-overlapping audio begins
+      endSec: times[j],
+    });
+    i = j;
+  }
+  // Fold a tail chunk that is mostly overlap back into its predecessor.
+  if (chunks.length > 1) {
+    const tail = chunks[chunks.length - 1];
+    if (tail.endSec - tail.contentStartSec < Math.max(30, overlapSeconds * 2)) {
+      chunks.pop();
+      const prev = chunks[chunks.length - 1];
+      prev.byteEnd = tail.byteEnd;
+      prev.endSec = tail.endSec;
+      prev.blob = file.slice(prev.byteStart, prev.byteEnd, "audio/mpeg");
+    }
+  }
+  return { chunks, totalDuration: times[last] };
+}
+
+// ── Deepgram (chunked) ──
+// Deepgram returns 504 for any pre-recorded request that takes over 10 minutes to
+// process. One 3-hour upload blows straight through that, and the connection dies
+// mid-body — which surfaces as "Failed to fetch" on response.json(), not as an
+// HTTP error. Keeping every request to ~10 minutes of audio avoids the wall entirely.
+const DG_URL = "https://api.deepgram.com/v1/listen?model=nova-3&language=multi"
+  + "&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true";
+
+async function postDeepgramChunk(chunk, apiKey, { timeoutMs = 240000, retries = 3 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetchOr("Deepgram", DG_URL, {
+        method: "POST",
+        headers: { Authorization: "Token " + apiKey, "Content-Type": "audio/mpeg" },
+        body: chunk.blob,
+        signal: ac.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+          throw new Error(`transient ${res.status}`);
+        }
+        throw Object.assign(
+          new Error(`Deepgram API error (${res.status}): ${body.slice(0, 300)}`),
+          { fatal: true }
+        );
+      }
+      // Body read stays inside the try: a dropped connection lands here.
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      if (err.fatal || attempt === retries) break;
+      await new Promise((r) => setTimeout(r, Math.min(30000, 1500 * 2 ** attempt)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (lastErr?.fatal) throw lastErr;
+  throw new Error(`Audio part ${chunk.index + 1} failed after retries: ${lastErr?.message}`);
+}
+
+async function transcribeChunked(chunks, apiKey, { concurrency = 3, onProgress } = {}) {
+  const out = new Array(chunks.length);
+  let next = 0, done = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, chunks.length) }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= chunks.length) return;
+        out[i] = { chunk: chunks[i], json: await postDeepgramChunk(chunks[i], apiKey) };
+        onProgress?.(++done / chunks.length, done, chunks.length);
+      }
+    })
+  );
+  return out;
+}
+
+// Re-base timestamps and re-anchor speaker ids. Deepgram diarizes each request
+// independently, so "Speaker 0" in one chunk is not the same person as in the next;
+// the overlap window is used to stitch identities back together.
+const normText = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+
+function mergeChunkedTranscripts(results, { dedupeMarginSec = 0.4 } = {}) {
+  const out = [];
+  let nextGlobal = 0;
+
+  for (const { chunk, json } of results) {
+    const alt = json?.results?.channels?.[0]?.alternatives?.[0];
+    let paras = alt?.paragraphs?.paragraphs || [];
+    // Fall back to the flat transcript rather than discarding a good result.
+    if (!paras.length && alt?.transcript?.trim()) {
+      paras = [{ start: 0, end: chunk.endSec - chunk.offsetSec,
+                 sentences: [{ text: alt.transcript.trim() }] }];
+    }
+    if (!paras.length) continue;
+
+    const off = chunk.offsetSec;
+    const seam = chunk.contentStartSec - off;
+    const map = new Map();
+
+    if (chunk.index > 0 && seam > 0) {
+      for (const p of paras) {
+        if (p.start >= seam) break;
+        if (p.speaker === undefined || map.has(p.speaker)) continue;
+        const mid = off + (p.start + Math.min(p.end, seam)) / 2;
+        let prior = null;
+        for (let q = out.length - 1; q >= 0; q--) {
+          if (out[q].start <= mid && out[q].end >= mid) { prior = out[q]; break; }
+          if (out[q].end <= mid && !prior) prior = out[q];
+        }
+        if (prior) map.set(p.speaker, prior.speaker);
+      }
+      // Two-speaker case: one unmapped local id + one unused global id => same person.
+      const locals = [...new Set(paras.map((p) => p.speaker).filter((s) => s !== undefined))];
+      const unmapped = locals.filter((l) => !map.has(l));
+      const used = new Set(map.values());
+      const free = [];
+      for (let g = 0; g < nextGlobal; g++) if (!used.has(g)) free.push(g);
+      if (unmapped.length === 1 && free.length === 1) map.set(unmapped[0], free[0]);
+    }
+
+    const globalOf = (l) => {
+      if (l === undefined) return undefined;
+      if (!map.has(l)) map.set(l, nextGlobal++);
+      const g = map.get(l);
+      if (g >= nextGlobal) nextGlobal = g + 1;
+      return g;
+    };
+
+    for (const p of paras) {
+      const text = (p.sentences || []).map((s) => s.text).join(" ").trim();
+      if (!text) continue;
+      if (chunk.index > 0 && p.end <= seam + dedupeMarginSec) { globalOf(p.speaker); continue; }
+      const abs = {
+        start: p.start + off, end: p.end + off,
+        speaker: globalOf(p.speaker), text, chunkIndex: chunk.index,
+      };
+      const prev = out[out.length - 1];
+      if (prev && prev.chunkIndex !== abs.chunkIndex && normText(prev.text) === normText(abs.text)) continue;
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+// ── Gemini (Interactions API, chunked) ──
+// A 3-hour transcript cannot be transliterated in one call: the output is as long as
+// the input and would blow the output-token ceiling. Chunking on speaker-turn
+// boundaries keeps each request well inside the limit.
+const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
+const MAX_CHUNK_CHARS = 8000;
+
+class TruncatedError extends Error {}
+
+function chunkTranscript(text, maxChars = MAX_CHUNK_CHARS) {
+  const turns = text.split(/\n\s*\n/);
+  const chunks = [];
+  let buf = "";
+  for (const turn of turns) {
+    const merged = buf ? buf + "\n\n" + turn : turn;
+    if (merged.length > maxChars && buf) { chunks.push(buf); buf = turn; }
+    else buf = merged;
+  }
+  if (buf.trim()) chunks.push(buf);
+  return chunks;
+}
+
+// steps[] is the source of truth; output_text is an SDK convenience that the raw REST
+// body does not always carry. Filtering to model_output also drops thinking steps, so
+// the model's reasoning can never leak into the transcript.
+function extractInteractionText(it) {
+  if (typeof it?.output_text === "string" && it.output_text.trim()) return it.output_text;
+  return (Array.isArray(it?.steps) ? it.steps : [])
+    .filter((s) => s?.type === "model_output")
+    .flatMap((s) => (Array.isArray(s?.content) ? s.content : []))
+    .filter((c) => c?.type === "text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("");
+}
+
+async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
+  const body = JSON.stringify({
+    model: GEMINI_MODEL,
+    input: chunk,
+    system_instruction: systemPrompt,
+    generation_config: {
+      thinking_level: "minimal", // 3.6-flash defaults to "medium"; thinking eats the output budget
+      max_output_tokens: 32768,
+      seed: 7, // the Interactions API has no temperature
+    },
+  });
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 180000);
+    try {
+      const res = await fetchOr("Gemini", GEMINI_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body,
+        signal: ac.signal,
+      });
+
+      if (res.status === 429 || res.status >= 500) throw new Error("__retry__");
+      if (!res.ok) {
+        throw Object.assign(
+          new Error(`Gemini API error (${res.status}): ${(await res.text()).slice(0, 300)}`),
+          { fatal: true }
+        );
+      }
+
+      const it = await res.json();
+      if (it.status === "incomplete") throw new TruncatedError();
+      if (it.status === "failed" || it.status === "cancelled") {
+        throw Object.assign(new Error(`Gemini interaction ${it.status}.`), { fatal: true });
+      }
+
+      const text = extractInteractionText(it).trim();
+      if (!text) throw new Error("__retry__");
+      return text;
+    } catch (err) {
+      if (err instanceof TruncatedError || err.fatal) throw err;
+      if (attempt === 4) {
+        throw new Error(
+          err.name === "AbortError" ? "Gemini timed out after several attempts." : err.message
+        );
+      }
+      const waitSec = Math.min(15, 2 ** attempt);
+      onRetryWait?.(waitSec);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// On a truncated response, halve the chunk and retry rather than dead-ending.
+async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth = 0) {
+  try {
+    return await callInteractions(chunk, key, systemPrompt, onRetryWait);
+  } catch (err) {
+    if (!(err instanceof TruncatedError) || depth >= 3) {
+      if (err instanceof TruncatedError) {
+        throw new Error("Gemini kept truncating this section even after splitting it down.");
+      }
+      throw err;
+    }
+    const halves = chunkTranscript(chunk, Math.max(500, Math.floor(chunk.length / 2)));
+    const parts = [];
+    for (const h of halves) {
+      parts.push(await transliterateChunk(h, key, systemPrompt, onRetryWait, depth + 1));
+    }
+    return parts.join("\n\n");
+  }
+}
+
+async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait } = {}) {
+  const chunks = chunkTranscript(transcript);
+  const out = new Array(chunks.length);
+  let next = 0, done = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= chunks.length) return;
+      out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait);
+      onProgress?.(++done, chunks.length);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  return out.join("\n\n");
+}
+
 // ── Main Pipeline ──
 processBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
@@ -307,7 +772,6 @@ processBtn.addEventListener("click", async () => {
 
   try {
     let uploadBody = selectedFile;
-    let contentType = "audio/mpeg";
     let stepIndex = 0;
 
     const cloudConvertKey = localStorage.getItem("cloudConvertKey");
@@ -334,7 +798,7 @@ processBtn.addEventListener("click", async () => {
         }
       };
 
-      const jobRes = await fetch("https://api.cloudconvert.com/v2/jobs", {
+      const jobRes = await fetchOr("CloudConvert", "https://api.cloudconvert.com/v2/jobs", {
         method: "POST",
         headers: {
           "Authorization": "Bearer " + cloudConvertKey,
@@ -356,14 +820,14 @@ processBtn.addEventListener("click", async () => {
       }
       formData.append("file", selectedFile);
 
-      const uploadRes = await fetch(importTask.result.form.url, {
+      const uploadRes = await fetchOr("CloudConvert", importTask.result.form.url, {
         method: "POST",
         body: formData
       });
       if (!uploadRes.ok) throw new Error("CloudConvert upload failed.");
 
       showStatus("Preparing the audio…", 20, stepIndex);
-      const waitRes = await fetch(`https://api.cloudconvert.com/v2/jobs/${jobData.data.id}/wait`, {
+      const waitRes = await fetchOr("CloudConvert", `https://api.cloudconvert.com/v2/jobs/${jobData.data.id}/wait`, {
         headers: { "Authorization": "Bearer " + cloudConvertKey }
       });
       if (!waitRes.ok) throw new Error("CloudConvert wait failed.");
@@ -377,62 +841,61 @@ processBtn.addEventListener("click", async () => {
       const fileUrl = exportTask.result.files[0].url;
 
       showStatus("Preparing the audio…", 30, stepIndex);
-      const fileRes = await fetch(fileUrl);
+      const fileRes = await fetchOr("CloudConvert", fileUrl);
       uploadBody = await fileRes.blob();
     } else {
       showStatus("Preparing the audio…", 10, stepIndex);
     }
 
+    // Split into frame-aligned parts so no single request can hit Deepgram's
+    // 10-minute processing limit.
+    const { chunks } = await splitMp3ByFrames(uploadBody, {
+      maxBytes: 40 * 1024 * 1024,
+      maxSeconds: 600,
+      overlapSeconds: 8,
+      onProgress: (p) =>
+        showStatus(`Preparing the audio… ${Math.round(p * 100)}%`, 5 + p * 10, stepIndex),
+    });
+
     stepIndex++;
 
     // ── Step 2: Upload to Deepgram ──
-    showStatus("Understanding the conversation…", 40, stepIndex);
-
-    const dgResponse = await fetch(
-      "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true&diarize=true&paragraphs=true&mip_opt_out=true",
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Token " + deepgramKey,
-          "Content-Type": contentType,
-        },
-        body: uploadBody,
-      }
+    showStatus(
+      chunks.length > 1
+        ? `Understanding the conversation… (0/${chunks.length} parts)`
+        : "Understanding the conversation…",
+      20,
+      stepIndex
     );
 
-    if (!dgResponse.ok) {
-      const errBody = await dgResponse.text();
-      throw new Error(
-        `Deepgram API error (${dgResponse.status}): ${errBody}`
-      );
-    }
+    const dgResults = await transcribeChunked(chunks, deepgramKey, {
+      concurrency: 3,
+      onProgress: (frac, done, total) =>
+        showStatus(
+          total > 1
+            ? `Understanding the conversation… (${done}/${total} parts)`
+            : "Understanding the conversation…",
+          20 + frac * 35,
+          stepIndex
+        ),
+    });
 
-    // ── Step 3: Parse Deepgram Response ──
+    // ── Step 3: Merge the parts into one transcript ──
     stepIndex++;
     showStatus("Writing the transcript…", 60, stepIndex);
 
-    const dgData = await dgResponse.json();
+    const merged = mergeChunkedTranscripts(dgResults);
 
-    // Construct speaker-labelled transcript
-    const paragraphs =
-      dgData?.results?.channels?.[0]?.alternatives?.[0]?.paragraphs
-        ?.paragraphs;
-
-    if (!paragraphs || paragraphs.length === 0) {
+    if (!merged.length) {
       throw new Error(
-        "Deepgram returned no paragraph data. The audio may be too short, silent, or in an unsupported format."
+        "Deepgram returned no speech for this audio. It may be silent, too short, or in an unsupported format."
       );
     }
 
-    let constructedTranscript = "";
-    for (const para of paragraphs) {
-      const speaker = para.speaker !== undefined ? para.speaker : "?";
-      const timeStr = formatTime(para.start);
-      const sentences = (para.sentences || []).map((s) => s.text).join(" ").trim();
-      constructedTranscript += `${timeStr} Speaker ${speaker}: ${sentences}\n\n`;
-    }
-
-    constructedTranscript = constructedTranscript.trim();
+    const constructedTranscript = merged
+      .map((p) => `${formatTime(p.start)} Speaker ${p.speaker ?? "?"}: ${p.text}`)
+      .join("\n\n")
+      .trim();
 
     if (!constructedTranscript) {
       throw new Error(
@@ -464,106 +927,22 @@ STRICT RULES YOU MUST FOLLOW:
 
 This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The output must be a faithful Roman-script mirror of the input.`;
 
-    const geminiPayload = {
-      contents: [
-        {
-          parts: [
-            {
-              text: systemPrompt + "\n\n" + constructedTranscript,
-            },
-          ],
-        },
-      ],
-    };
-
-    const GEMINI_MODEL = "gemini-3.5-flash";
-    const MAX_RETRIES = 3;
-    let gmData = null;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      const gmResponse = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": geminiKey,
-          },
-          body: JSON.stringify(geminiPayload),
-        }
-      );
-
-      if (gmResponse.ok) {
-        gmData = await gmResponse.json();
-        break;
-      }
-
-      if (gmResponse.status === 429 && attempt < MAX_RETRIES) {
-        // Parse retry delay from response, default to 30s
-        let waitSec = 30;
-        try {
-          const errJson = await gmResponse.json();
-          const retryInfo = errJson?.error?.details?.find((d) =>
-            d["@type"]?.includes("RetryInfo")
-          );
-          if (retryInfo?.retryDelay) {
-            waitSec = Math.ceil(
-              parseFloat(retryInfo.retryDelay.replace("s", ""))
-            );
-          }
-        } catch {
-          /* use default */
-        }
-
-        // Countdown in the UI
-        for (let s = waitSec; s > 0; s--) {
+    const hinglishText = (
+      await transliterateAll(constructedTranscript, geminiKey, systemPrompt, {
+        onProgress: (done, total) =>
           showStatus(
-            `Taking a brief pause, retrying in ${s}s…`,
-            75,
+            total > 1
+              ? `Shaping your words into Hinglish… (${done}/${total} sections)`
+              : "Shaping your words into Hinglish…",
+            75 + (done / total) * 20,
             stepIndex
-          );
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-        showStatus(
-          `Shaping your words into Hinglish…`,
-          80,
-          stepIndex
-        );
-        continue;
-      }
-
-      // Non-retryable error
-      const errBody = await gmResponse.text();
-      throw new Error(
-        `Gemini API error (${gmResponse.status}): ${errBody}`
-      );
-    }
-
-    if (!gmData) {
-      throw new Error(
-        "Gemini API rate limit exceeded after multiple retries. Please wait a minute and try again."
-      );
-    }
-
-    const candidate = gmData?.candidates?.[0];
-    const hinglishText = (candidate?.content?.parts || [])
-      .map((p) => p.text)
-      .filter(Boolean)
-      .join("")
-      .trim();
+          ),
+        onRetryWait: (sec) =>
+          showStatus(`Taking a brief pause, retrying in ${sec}s…`, 75, stepIndex),
+      })
+    ).trim();
 
     if (!hinglishText) {
-      const finishReason = candidate?.finishReason;
-      if (finishReason === "MAX_TOKENS") {
-        throw new Error(
-          "The transcript was too long for Gemini to process in a single pass. Please try a shorter audio file."
-        );
-      }
-      if (finishReason && finishReason !== "STOP") {
-        throw new Error(
-          `Gemini stopped without returning any text (reason: ${finishReason}). Please try again.`
-        );
-      }
       throw new Error(
         "Gemini returned an empty or unexpected response. Please check your API key and try again."
       );
