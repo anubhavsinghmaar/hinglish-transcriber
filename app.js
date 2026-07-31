@@ -452,8 +452,13 @@ async function splitMp3ByFrames(file, {
       lastFrameEnd = cursor;
     }
 
+    // Clamp to what is actually buffered. A leading ID3v2 tag (cover art routinely
+    // pushes this past 128 KB) can put `cursor` beyond `carry`, and advancing
+    // carryBase by more than we can drop would desync it from the real file offset
+    // permanently — silently shifting every frame offset and timestamp after it.
     const keepFrom = Math.max(0, cursor - carryBase - FRAME_CARRY);
-    if (keepFrom > 0) { carry = carry.slice(keepFrom); carryBase += keepFrom; }
+    const drop = Math.min(keepFrom, carry.length);
+    if (drop > 0) { carry = carry.slice(drop); carryBase += drop; }
     onProgress?.(Math.min(1, cursor / file.size));
   }
   reader.releaseLock?.();
@@ -589,15 +594,27 @@ function mergeChunkedTranscripts(results, { dedupeMarginSec = 0.4 } = {}) {
           if (out[q].start <= mid && out[q].end >= mid) { prior = out[q]; break; }
           if (out[q].end <= mid && !prior) prior = out[q];
         }
-        if (prior) map.set(p.speaker, prior.speaker);
+        // Only anchor to a real speaker, and never map two local ids onto the same
+        // global one — that would merge two people into a single speaker downstream.
+        if (prior && prior.speaker !== undefined && ![...map.values()].includes(prior.speaker)) {
+          map.set(p.speaker, prior.speaker);
+        }
       }
-      // Two-speaker case: one unmapped local id + one unused global id => same person.
+      // Two-speaker case only: one unmapped local id + one unused global id => same
+      // person. With 3+ voices this is a counting coincidence, not evidence — it
+      // would happily fuse a brand-new guest onto someone who just went quiet.
       const locals = [...new Set(paras.map((p) => p.speaker).filter((s) => s !== undefined))];
       const unmapped = locals.filter((l) => !map.has(l));
       const used = new Set(map.values());
       const free = [];
       for (let g = 0; g < nextGlobal; g++) if (!used.has(g)) free.push(g);
-      if (unmapped.length === 1 && free.length === 1) map.set(unmapped[0], free[0]);
+      // Requires map.size > 0: the gap-fill is only justified once the overlap has
+      // actually anchored someone. With no anchor at all it is a pure guess, and it
+      // would silently rename a different person into an existing speaker.
+      if (map.size > 0 && unmapped.length === 1 && free.length === 1
+          && locals.length <= 2 && nextGlobal <= 2) {
+        map.set(unmapped[0], free[0]);
+      }
     }
 
     const globalOf = (l) => {
@@ -609,15 +626,32 @@ function mergeChunkedTranscripts(results, { dedupeMarginSec = 0.4 } = {}) {
     };
 
     for (const p of paras) {
-      const text = (p.sentences || []).map((s) => s.text).join(" ").trim();
-      if (!text) continue;
-      if (chunk.index > 0 && p.end <= seam + dedupeMarginSec) { globalOf(p.speaker); continue; }
+      let sentences = p.sentences || [];
+      let startRel = p.start;
+
+      // The previous chunk already transcribed everything before the seam. Drop only
+      // the sentences that fall inside it: a paragraph straddling the seam is the
+      // normal case (paragraphs run 15-40s, the seam is 8s), so discarding it whole
+      // would lose real speech, and keeping it whole repeats what was already emitted.
+      if (chunk.index > 0 && seam > 0 && p.start < seam) {
+        sentences = sentences.filter((s) => (s.end ?? p.end) > seam + dedupeMarginSec);
+        startRel = Math.max(p.start, seam);
+      }
+
+      const text = sentences.map((s) => s.text).join(" ").trim();
+      if (!text) { globalOf(p.speaker); continue; }
+
       const abs = {
-        start: p.start + off, end: p.end + off,
+        start: startRel + off, end: p.end + off,
         speaker: globalOf(p.speaker), text, chunkIndex: chunk.index,
       };
       const prev = out[out.length - 1];
-      if (prev && prev.chunkIndex !== abs.chunkIndex && normText(prev.text) === normText(abs.text)) continue;
+      // Only treat this as a seam duplicate if it is the same speaker saying the same
+      // thing at essentially the same moment — otherwise a genuine "haan" from the
+      // other speaker seconds later gets deleted.
+      if (prev && prev.chunkIndex !== abs.chunkIndex && prev.speaker === abs.speaker
+          && Math.abs(abs.start - prev.start) < 2.5
+          && normText(prev.text) === normText(abs.text)) continue;
       out.push(abs);
     }
   }
@@ -635,7 +669,23 @@ const MAX_CHUNK_CHARS = 8000;
 class TruncatedError extends Error {}
 
 function chunkTranscript(text, maxChars = MAX_CHUNK_CHARS) {
-  const turns = text.split(/\n\s*\n/);
+  // A single speaker turn can exceed maxChars on its own — the flat-transcript
+  // fallback emits a whole part as one line. Splitting only on blank lines would
+  // return it unchanged, so the truncation-recovery halving below could never
+  // shrink it and would just re-send identical input until it gave up.
+  const turns = [];
+  for (const turn of text.split(/\n\s*\n/)) {
+    if (turn.length <= maxChars) { turns.push(turn); continue; }
+    let rest = turn;
+    while (rest.length > maxChars) {
+      let cut = rest.lastIndexOf(" ", maxChars);
+      if (cut < maxChars * 0.5) cut = maxChars; // no space to break on
+      turns.push(rest.slice(0, cut));
+      rest = rest.slice(cut).trimStart();
+    }
+    if (rest) turns.push(rest);
+  }
+
   const chunks = [];
   let buf = "";
   for (const turn of turns) {
@@ -672,7 +722,8 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
     },
   });
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 180000);
     try {
@@ -683,7 +734,23 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
         signal: ac.signal,
       });
 
-      if (res.status === 429 || res.status >= 500) throw new Error("__retry__");
+      if (res.status === 429 || res.status >= 500) {
+        // Honour the server's own RetryInfo — a free-tier quota window is usually
+        // far longer than a short exponential backoff would wait out.
+        let waitSec = Math.min(15, 2 ** attempt);
+        if (res.status === 429) {
+          try {
+            const errJson = await res.clone().json();
+            const retryInfo = errJson?.error?.details?.find((d) =>
+              d["@type"]?.includes("RetryInfo")
+            );
+            if (retryInfo?.retryDelay) {
+              waitSec = Math.min(60, Math.ceil(parseFloat(retryInfo.retryDelay.replace("s", ""))) || waitSec);
+            }
+          } catch { /* keep the backoff default */ }
+        }
+        throw Object.assign(new Error(`Gemini ${res.status}`), { retryable: true, status: res.status, waitSec });
+      }
       if (!res.ok) {
         throw Object.assign(
           new Error(`Gemini API error (${res.status}): ${(await res.text()).slice(0, 300)}`),
@@ -698,16 +765,28 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
       }
 
       const text = extractInteractionText(it).trim();
-      if (!text) throw new Error("__retry__");
+      if (!text) {
+        throw Object.assign(new Error("Gemini returned no text"), { retryable: true, waitSec: 2 ** attempt });
+      }
       return text;
     } catch (err) {
       if (err instanceof TruncatedError || err.fatal) throw err;
-      if (attempt === 4) {
-        throw new Error(
-          err.name === "AbortError" ? "Gemini timed out after several attempts." : err.message
-        );
+      if (attempt === MAX_ATTEMPTS) {
+        // Never surface an internal retry marker — say what actually went wrong.
+        if (err.status === 429) {
+          throw new Error(
+            "Gemini rate limit reached and it did not clear after several retries. Please wait a minute and try again."
+          );
+        }
+        if (err.name === "AbortError") throw new Error("Gemini timed out after several attempts.");
+        if (err.retryable) {
+          throw new Error(
+            "Gemini kept returning an empty or unavailable response. Please check your API key and try again."
+          );
+        }
+        throw err;
       }
-      const waitSec = Math.min(15, 2 ** attempt);
+      const waitSec = err.waitSec ?? Math.min(15, 2 ** attempt);
       onRetryWait?.(waitSec);
       await new Promise((r) => setTimeout(r, waitSec * 1000));
     } finally {
@@ -739,16 +818,25 @@ async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth =
 async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait } = {}) {
   const chunks = chunkTranscript(transcript);
   const out = new Array(chunks.length);
-  let next = 0, done = 0;
+  let next = 0, done = 0, aborted = false;
+  // Without this, a failure in one worker leaves the others firing requests against
+  // the same key long after the UI has reported failure and re-enabled the button.
   const worker = async () => {
     for (;;) {
+      if (aborted) return;
       const i = next++;
       if (i >= chunks.length) return;
-      out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait);
+      try {
+        out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait);
+      } catch (err) {
+        aborted = true;
+        throw err;
+      }
       onProgress?.(++done, chunks.length);
     }
   };
-  await Promise.all([worker(), worker(), worker()]);
+  const pool = Math.min(3, chunks.length);
+  await Promise.all(Array.from({ length: pool }, worker));
   return out.join("\n\n");
 }
 
@@ -773,6 +861,7 @@ processBtn.addEventListener("click", async () => {
   try {
     let uploadBody = selectedFile;
     let stepIndex = 0;
+    let prepBase = 10; // where "Preparing the audio" has already reached
 
     const cloudConvertKey = localStorage.getItem("cloudConvertKey");
     if (cloudConvertKey) {
@@ -841,7 +930,13 @@ processBtn.addEventListener("click", async () => {
       const fileUrl = exportTask.result.files[0].url;
 
       showStatus("Preparing the audio…", 30, stepIndex);
+      prepBase = 30;
       const fileRes = await fetchOr("CloudConvert", fileUrl);
+      if (!fileRes.ok) {
+        throw new Error(
+          `CloudConvert download failed (${fileRes.status}). The compressed file link may have expired — try again, or remove your CloudConvert key to upload the original audio.`
+        );
+      }
       uploadBody = await fileRes.blob();
     } else {
       showStatus("Preparing the audio…", 10, stepIndex);
@@ -854,7 +949,7 @@ processBtn.addEventListener("click", async () => {
       maxSeconds: 600,
       overlapSeconds: 8,
       onProgress: (p) =>
-        showStatus(`Preparing the audio… ${Math.round(p * 100)}%`, 5 + p * 10, stepIndex),
+        showStatus(`Preparing the audio… ${Math.round(p * 100)}%`, prepBase + p * 8, stepIndex),
     });
 
     stepIndex++;
