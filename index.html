@@ -214,6 +214,35 @@
         </div>
       </div>
 
+      <div class="field-row">
+        <label for="anthropicKeyInput">Anthropic API key (for Claude)</label>
+        <div class="field-wrap">
+          <input id="anthropicKeyInput" type="password" placeholder="sk-ant-api… or sk-ant-oat…" />
+          <button onclick="toggleVisibility('anthropicKeyInput', this)" class="icon-btn" type="button" aria-label="Toggle key visibility">
+            <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <svg class="eye-closed hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 3l18 18" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.58 10.58A2 2 0 0012 14a2 2 0 001.42-.58" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M6.71 6.7C4.53 8.06 3.13 10.1 2.5 12c1.3 3.83 4.9 6 9.5 6a10 10 0 004.35-.95" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9.87 5.22A10.6 10.6 0 0112 5c6 0 9.5 7 9.5 7a13.4 13.4 0 01-1.67 2.5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label for="providerSelect">Romanize with</label>
+        <div class="field-wrap">
+          <select id="providerSelect" class="field-select">
+            <option value="gemini">Gemini 3.6 Flash</option>
+            <option value="claude">Claude Sonnet 5</option>
+          </select>
+        </div>
+      </div>
+
       <p id="saveStatus" class="save-status hidden">Keys saved</p>
       <button id="saveKeysBtn" type="button" class="primary-btn modal-btn">Save keys</button>
     </div>

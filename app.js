@@ -6,6 +6,8 @@ const closeModalBtn = $("closeModalBtn");
 const deepgramKeyInput = $("deepgramKeyInput");
 const geminiKeyInput = $("geminiKeyInput");
 const cloudConvertKeyInput = $("cloudConvertKeyInput");
+const anthropicKeyInput = $("anthropicKeyInput");
+const providerSelect = $("providerSelect");
 const saveKeysBtn = $("saveKeysBtn");
 const saveStatus = $("saveStatus");
 const dropZone = $("dropZone");
@@ -119,6 +121,8 @@ function openModal() {
   deepgramKeyInput.value = localStorage.getItem("deepgramKey") || "";
   geminiKeyInput.value = localStorage.getItem("geminiKey") || "";
   cloudConvertKeyInput.value = localStorage.getItem("cloudConvertKey") || "";
+  anthropicKeyInput.value = localStorage.getItem("anthropicKey") || "";
+  providerSelect.value = localStorage.getItem("provider") || "gemini";
   saveStatus.classList.add("hidden");
   settingsModal.style.display = "flex";
   settingsModal.classList.remove("hidden");
@@ -143,6 +147,10 @@ saveKeysBtn.addEventListener("click", () => {
   const dg = deepgramKeyInput.value.trim();
   const gm = geminiKeyInput.value.trim();
   const cc = cloudConvertKeyInput.value.trim();
+  const an = anthropicKeyInput.value.trim();
+  if (an) localStorage.setItem("anthropicKey", an);
+  else localStorage.removeItem("anthropicKey");
+  localStorage.setItem("provider", providerSelect.value);
   if (dg) localStorage.setItem("deepgramKey", dg);
   else localStorage.removeItem("deepgramKey");
   if (gm) localStorage.setItem("geminiKey", gm);
@@ -795,27 +803,132 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
   }
 }
 
+// ── Claude (Messages API) ──
+// Direct browser calls need the anthropic-dangerous-direct-browser-access header;
+// without it the request is rejected before CORS. An OAuth token from `ant auth`
+// goes on Authorization: Bearer with the oauth beta instead of x-api-key.
+const CLAUDE_MODEL = "claude-sonnet-5";
+const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
+
+function claudeAuthHeaders(key) {
+  const headers = {
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true",
+  };
+  if (key.startsWith("sk-ant-oat")) {
+    headers["authorization"] = "Bearer " + key;
+    headers["anthropic-beta"] = "oauth-2025-04-20";
+  } else {
+    headers["x-api-key"] = key;
+  }
+  return headers;
+}
+
+async function callClaude(chunk, key, systemPrompt, onRetryWait) {
+  const body = JSON.stringify({
+    model: CLAUDE_MODEL,
+    max_tokens: 16000,
+    system: systemPrompt,
+    messages: [{ role: "user", content: chunk }],
+    // Effort lives inside output_config, not top-level. Sonnet 5 rejects
+    // temperature/top_p/top_k outright, so tone is steered by the prompt alone.
+    output_config: { effort: "medium" },
+  });
+
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 180000);
+    try {
+      const res = await fetchOr("Claude", CLAUDE_URL, {
+        method: "POST",
+        headers: claudeAuthHeaders(key),
+        body,
+        signal: ac.signal,
+      });
+
+      if (res.status === 429 || res.status >= 500) {
+        let waitSec = Math.min(15, 2 ** attempt);
+        const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
+        if (Number.isFinite(retryAfter)) waitSec = Math.min(60, retryAfter);
+        throw Object.assign(new Error(`Claude ${res.status}`), { retryable: true, status: res.status, waitSec });
+      }
+      if (!res.ok) {
+        throw Object.assign(
+          new Error(`Claude API error (${res.status}): ${(await res.text()).slice(0, 300)}`),
+          { fatal: true }
+        );
+      }
+
+      const msg = await res.json();
+      if (msg.stop_reason === "max_tokens") throw new TruncatedError();
+      if (msg.stop_reason === "refusal") {
+        throw Object.assign(
+          new Error("Claude declined to transliterate this section. Try the Gemini option for this file."),
+          { fatal: true }
+        );
+      }
+
+      // content is a block union — thinking blocks can precede the answer.
+      const text = (Array.isArray(msg.content) ? msg.content : [])
+        .filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text)
+        .join("")
+        .trim();
+
+      if (!text) {
+        throw Object.assign(new Error("Claude returned no text"), { retryable: true, waitSec: 2 ** attempt });
+      }
+      return text;
+    } catch (err) {
+      if (err instanceof TruncatedError || err.fatal) throw err;
+      if (attempt === MAX_ATTEMPTS) {
+        if (err.status === 429) {
+          throw new Error(
+            "Claude rate limit reached and it did not clear after several retries. Please wait a minute and try again."
+          );
+        }
+        if (err.name === "AbortError") throw new Error("Claude timed out after several attempts.");
+        if (err.retryable) {
+          throw new Error(
+            "Claude kept returning an empty or unavailable response. Please check your Anthropic API key and try again."
+          );
+        }
+        throw err;
+      }
+      const waitSec = err.waitSec ?? Math.min(15, 2 ** attempt);
+      onRetryWait?.(waitSec);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
 // On a truncated response, halve the chunk and retry rather than dead-ending.
-async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth = 0) {
+async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth = 0, provider = "gemini") {
   try {
-    return await callInteractions(chunk, key, systemPrompt, onRetryWait);
+    return provider === "claude"
+      ? await callClaude(chunk, key, systemPrompt, onRetryWait)
+      : await callInteractions(chunk, key, systemPrompt, onRetryWait);
   } catch (err) {
     if (!(err instanceof TruncatedError) || depth >= 3) {
       if (err instanceof TruncatedError) {
-        throw new Error("Gemini kept truncating this section even after splitting it down.");
+        throw new Error("The model kept truncating this section even after splitting it down.");
       }
       throw err;
     }
     const halves = chunkTranscript(chunk, Math.max(500, Math.floor(chunk.length / 2)));
     const parts = [];
     for (const h of halves) {
-      parts.push(await transliterateChunk(h, key, systemPrompt, onRetryWait, depth + 1));
+      parts.push(await transliterateChunk(h, key, systemPrompt, onRetryWait, depth + 1, provider));
     }
     return parts.join("\n\n");
   }
 }
 
-async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait } = {}) {
+async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait, provider = "gemini" } = {}) {
   const chunks = chunkTranscript(transcript);
   const out = new Array(chunks.length);
   let next = 0, done = 0, aborted = false;
@@ -827,7 +940,7 @@ async function transliterateAll(transcript, key, systemPrompt, { onProgress, onR
       const i = next++;
       if (i >= chunks.length) return;
       try {
-        out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait);
+        out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait, 0, provider);
       } catch (err) {
         aborted = true;
         throw err;
@@ -845,11 +958,25 @@ processBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
 
   const deepgramKey = localStorage.getItem("deepgramKey");
-  const geminiKey = localStorage.getItem("geminiKey");
+  const provider = localStorage.getItem("provider") || "gemini";
+  const providerLabel = provider === "claude" ? "Claude Sonnet 5" : "Gemini";
+  const romanizeKey =
+    provider === "claude"
+      ? localStorage.getItem("anthropicKey")
+      : localStorage.getItem("geminiKey");
 
-  if (!deepgramKey || !geminiKey) {
+  if (!deepgramKey) {
     showError(
-      "API keys are missing. Please open Settings and add both your Deepgram and Gemini API keys."
+      "Your Deepgram API key is missing. Please open Settings and add it."
+    );
+    openModal();
+    return;
+  }
+  if (!romanizeKey) {
+    showError(
+      provider === "claude"
+        ? "Your Anthropic API key is missing. Please open Settings and add it, or switch \u201cRomanize with\u201d back to Gemini."
+        : "Your Gemini API key is missing. Please open Settings and add it, or switch \u201cRomanize with\u201d to Claude Sonnet 5."
     );
     openModal();
     return;
@@ -1023,12 +1150,13 @@ STRICT RULES YOU MUST FOLLOW:
 This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The output must be a faithful Roman-script mirror of the input.`;
 
     const hinglishText = (
-      await transliterateAll(constructedTranscript, geminiKey, systemPrompt, {
+      await transliterateAll(constructedTranscript, romanizeKey, systemPrompt, {
+        provider,
         onProgress: (done, total) =>
           showStatus(
             total > 1
-              ? `Shaping your words into Hinglish… (${done}/${total} sections)`
-              : "Shaping your words into Hinglish…",
+              ? `Shaping your words into Hinglish with ${providerLabel}… (${done}/${total} sections)`
+              : `Shaping your words into Hinglish with ${providerLabel}…`,
             75 + (done / total) * 20,
             stepIndex
           ),
