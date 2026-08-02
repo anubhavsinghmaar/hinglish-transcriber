@@ -676,6 +676,47 @@ const MAX_CHUNK_CHARS = 8000;
 
 class TruncatedError extends Error {}
 
+// ── Shared rate gate ──
+// Independent per-worker backoff is what turns one 429 into a stampede: every
+// worker sleeps its own interval and they all resume together, tripping the
+// limit again. One gate for the whole run hands out spaced slots, and a 429 in
+// any worker pushes back the slot for all of them and permanently widens the
+// spacing — so the run self-tunes down to whatever the key's quota allows.
+// budgetMs bounds how long a run may spend purely waiting out rate limits. A
+// per-minute limit clears in seconds and is worth riding out; an exhausted daily
+// quota never clears, and without a ceiling the user watches a countdown for many
+// minutes before an inevitable failure. Stopping early keeps the finished
+// sections and hands back control.
+function makeRateGate(minGapMs = 0, budgetMs = 120000) {
+  let nextSlot = 0;
+  let gap = minGapMs;
+  let waited = 0;
+  return {
+    exhausted: () => waited >= budgetMs,
+    async acquire(onWait) {
+      const now = Date.now();
+      const start = Math.max(now, nextSlot);
+      nextSlot = start + gap;
+      const delay = start - now;
+      if (delay > 0) {
+        if (delay > minGapMs) waited += delay;
+        if (delay > 1500) onWait?.(Math.ceil(delay / 1000));
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    },
+    backoff(sec) {
+      gap = Math.min(20000, Math.max(gap * 2, 1200));
+      nextSlot = Math.max(nextSlot, Date.now() + sec * 1000);
+    },
+    // Back off fast, recover slowly. Without this a single transient 429 would
+    // hold the widened spacing for the rest of the run — on a long transcript
+    // that is minutes of avoidable waiting.
+    success() {
+      if (gap > minGapMs) gap = Math.max(minGapMs, Math.floor(gap * 0.7));
+    },
+  };
+}
+
 function chunkTranscript(text, maxChars = MAX_CHUNK_CHARS) {
   // A single speaker turn can exceed maxChars on its own — the flat-transcript
   // fallback emits a whole part as one line. Splitting only on blank lines would
@@ -718,7 +759,7 @@ function extractInteractionText(it) {
     .join("");
 }
 
-async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
+async function callInteractions(chunk, key, systemPrompt, onRetryWait, gate) {
   const body = JSON.stringify({
     model: GEMINI_MODEL,
     input: chunk,
@@ -730,11 +771,12 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
     },
   });
 
-  const MAX_ATTEMPTS = 4;
+  const MAX_ATTEMPTS = 6;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 180000);
     try {
+      await gate?.acquire(onRetryWait);
       const res = await fetchOr("Gemini", GEMINI_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": key },
@@ -757,6 +799,15 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
             }
           } catch { /* keep the backoff default */ }
         }
+        gate?.backoff(waitSec);
+        if (res.status === 429 && gate?.exhausted()) {
+          throw Object.assign(
+            new Error(
+              "Gemini rate limit did not clear after a couple of minutes of waiting — this usually means the key's quota is used up rather than a short burst limit. Try again later, or switch provider in Settings."
+            ),
+            { fatal: true }
+          );
+        }
         throw Object.assign(new Error(`Gemini ${res.status}`), { retryable: true, status: res.status, waitSec });
       }
       if (!res.ok) {
@@ -766,6 +817,7 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait) {
         );
       }
 
+      gate?.success();
       const it = await res.json();
       if (it.status === "incomplete") throw new TruncatedError();
       if (it.status === "failed" || it.status === "cancelled") {
@@ -825,7 +877,7 @@ function claudeAuthHeaders(key) {
   return headers;
 }
 
-async function callClaude(chunk, key, systemPrompt, onRetryWait) {
+async function callClaude(chunk, key, systemPrompt, onRetryWait, gate) {
   const body = JSON.stringify({
     model: CLAUDE_MODEL,
     max_tokens: 16000,
@@ -836,11 +888,12 @@ async function callClaude(chunk, key, systemPrompt, onRetryWait) {
     output_config: { effort: "medium" },
   });
 
-  const MAX_ATTEMPTS = 4;
+  const MAX_ATTEMPTS = 6;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 180000);
     try {
+      await gate?.acquire(onRetryWait);
       const res = await fetchOr("Claude", CLAUDE_URL, {
         method: "POST",
         headers: claudeAuthHeaders(key),
@@ -852,6 +905,15 @@ async function callClaude(chunk, key, systemPrompt, onRetryWait) {
         let waitSec = Math.min(15, 2 ** attempt);
         const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
         if (Number.isFinite(retryAfter)) waitSec = Math.min(60, retryAfter);
+        gate?.backoff(waitSec);
+        if (res.status === 429 && gate?.exhausted()) {
+          throw Object.assign(
+            new Error(
+              "Claude rate limit did not clear after a couple of minutes of waiting — this usually means the key's quota is used up rather than a short burst limit. Try again later, or switch provider in Settings."
+            ),
+            { fatal: true }
+          );
+        }
         throw Object.assign(new Error(`Claude ${res.status}`), { retryable: true, status: res.status, waitSec });
       }
       if (!res.ok) {
@@ -861,6 +923,7 @@ async function callClaude(chunk, key, systemPrompt, onRetryWait) {
         );
       }
 
+      gate?.success();
       const msg = await res.json();
       if (msg.stop_reason === "max_tokens") throw new TruncatedError();
       if (msg.stop_reason === "refusal") {
@@ -907,11 +970,11 @@ async function callClaude(chunk, key, systemPrompt, onRetryWait) {
 }
 
 // On a truncated response, halve the chunk and retry rather than dead-ending.
-async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth = 0, provider = "gemini") {
+async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth = 0, provider = "gemini", gate) {
   try {
     return provider === "claude"
-      ? await callClaude(chunk, key, systemPrompt, onRetryWait)
-      : await callInteractions(chunk, key, systemPrompt, onRetryWait);
+      ? await callClaude(chunk, key, systemPrompt, onRetryWait, gate)
+      : await callInteractions(chunk, key, systemPrompt, onRetryWait, gate);
   } catch (err) {
     if (!(err instanceof TruncatedError) || depth >= 3) {
       if (err instanceof TruncatedError) {
@@ -922,34 +985,71 @@ async function transliterateChunk(chunk, key, systemPrompt, onRetryWait, depth =
     const halves = chunkTranscript(chunk, Math.max(500, Math.floor(chunk.length / 2)));
     const parts = [];
     for (const h of halves) {
-      parts.push(await transliterateChunk(h, key, systemPrompt, onRetryWait, depth + 1, provider));
+      parts.push(await transliterateChunk(h, key, systemPrompt, onRetryWait, depth + 1, provider, gate));
     }
     return parts.join("\n\n");
   }
 }
 
-async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait, provider = "gemini" } = {}) {
+// Joins whatever has completed so far, in transcript order. A gap (a section
+// that has not landed yet) is marked rather than silently closed up, so a
+// partial transcript can never read as a complete one.
+function joinPartial(out, chunks) {
+  const parts = [];
+  let missing = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    if (typeof out[i] === "string") parts.push(out[i]);
+    else missing++;
+  }
+  if (missing > 0) {
+    parts.push(`\n[… ${missing} of ${chunks.length} sections did not finish — see the error above.]`);
+  }
+  return parts.join("\n\n");
+}
+
+async function transliterateAll(transcript, key, systemPrompt, { onProgress, onRetryWait, onPartial, provider = "gemini" } = {}) {
   const chunks = chunkTranscript(transcript);
   const out = new Array(chunks.length);
   let next = 0, done = 0, aborted = false;
-  // Without this, a failure in one worker leaves the others firing requests against
-  // the same key long after the UI has reported failure and re-enabled the button.
+  // One gate shared by every worker. Requests start at least 400ms apart even on
+  // a healthy key; a 429 anywhere widens that for everyone.
+  const gate = makeRateGate(400);
+  // A worker already asleep inside the gate when another worker fails would keep
+  // writing "retrying in Ns…" over the failure message, so the UI reads as still
+  // working after it has stopped. Silence the countdown once the run is over.
+  const guardedRetryWait = (sec) => { if (!aborted) onRetryWait?.(sec); };
+  // Without `aborted`, a failure in one worker leaves the others firing requests
+  // against the same key long after the UI has reported failure.
   const worker = async () => {
     for (;;) {
       if (aborted) return;
       const i = next++;
       if (i >= chunks.length) return;
       try {
-        out[i] = await transliterateChunk(chunks[i], key, systemPrompt, onRetryWait, 0, provider);
+        out[i] = await transliterateChunk(chunks[i], key, systemPrompt, guardedRetryWait, 0, provider, gate);
       } catch (err) {
         aborted = true;
         throw err;
       }
+      // Surface each finished section immediately. Deepgram has already been paid
+      // for by this point, so a later rate limit must not throw away the work
+      // that did land.
+      onPartial?.(joinPartial(out, chunks));
       onProgress?.(++done, chunks.length);
     }
   };
-  const pool = Math.min(3, chunks.length);
-  await Promise.all(Array.from({ length: pool }, worker));
+  // Two workers, not three: the ceiling here is the key's requests-per-minute
+  // quota, and a third concurrent request buys little while tripping free-tier
+  // limits much sooner.
+  const pool = Math.min(2, chunks.length);
+  try {
+    await Promise.all(Array.from({ length: pool }, worker));
+  } catch (err) {
+    err.partialText = joinPartial(out, chunks);
+    err.completedSections = out.filter((x) => typeof x === "string").length;
+    err.totalSections = chunks.length;
+    throw err;
+  }
   return out.join("\n\n");
 }
 
@@ -1152,6 +1252,7 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
     const hinglishText = (
       await transliterateAll(constructedTranscript, romanizeKey, systemPrompt, {
         provider,
+        onPartial: (text) => { outputArea.value = text; },
         onProgress: (done, total) =>
           showStatus(
             total > 1
@@ -1179,7 +1280,13 @@ This is a TRANSLITERATION task, NOT a translation or paraphrasing task. The outp
 
     showDone();
   } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
+    let errorMsg = err instanceof Error ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
+    // Anything already romanized stays on screen — the Deepgram spend is done.
+    if (typeof err?.partialText === "string" && err.completedSections > 0) {
+      outputArea.value = err.partialText;
+      outputCard.classList.remove("hidden");
+      errorMsg += ` ${err.completedSections} of ${err.totalSections} sections finished and are kept below — copy them, then re-run to redo the rest.`;
+    }
     showError(errorMsg || "An unknown error occurred.");
     statusSpinner.classList.add("hidden");
     statusError.classList.remove("hidden");
