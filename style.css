@@ -556,6 +556,23 @@ textarea::placeholder {
   border-color: rgba(107, 46, 46, 0.35);
   box-shadow: 0 0 0 3px rgba(107, 46, 46, 0.09);
 }
+.field-wrap .field-select {
+  flex: 1;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.55rem 0.7rem;
+  color: var(--text);
+  background: #fff;
+  font: inherit;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+.field-wrap .field-select:focus {
+  border-color: rgba(107, 46, 46, 0.35);
+  box-shadow: 0 0 0 3px rgba(107, 46, 46, 0.09);
+}
 
 .icon-btn {
   width: 34px;
