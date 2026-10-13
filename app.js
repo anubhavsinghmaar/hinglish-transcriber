@@ -859,7 +859,7 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait, gate) {
 // Direct browser calls need the anthropic-dangerous-direct-browser-access header;
 // without it the request is rejected before CORS. An OAuth token from `ant auth`
 // goes on Authorization: Bearer with the oauth beta instead of x-api-key.
-const CLAUDE_MODEL = "claude-sonnet-5";
+const CLAUDE_MODEL = "claude-haiku-5-5";
 const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
 
 function claudeAuthHeaders(key) {
@@ -880,12 +880,12 @@ function claudeAuthHeaders(key) {
 async function callClaude(chunk, key, systemPrompt, onRetryWait, gate) {
   const body = JSON.stringify({
     model: CLAUDE_MODEL,
-    max_tokens: 16000,
+    max_tokens: 32000, // headroom: at "high" effort, thinking shares this budget
     system: systemPrompt,
     messages: [{ role: "user", content: chunk }],
-    // Effort lives inside output_config, not top-level. Sonnet 5 rejects
+    // Effort lives inside output_config, not top-level. Haiku 5.5 rejects
     // temperature/top_p/top_k outright, so tone is steered by the prompt alone.
-    output_config: { effort: "medium" },
+    output_config: { effort: "high" },
   });
 
   const MAX_ATTEMPTS = 6;
@@ -1059,7 +1059,7 @@ processBtn.addEventListener("click", async () => {
 
   const deepgramKey = localStorage.getItem("deepgramKey");
   const provider = localStorage.getItem("provider") || "gemini";
-  const providerLabel = provider === "claude" ? "Claude Sonnet 5" : "Gemini";
+  const providerLabel = provider === "claude" ? "Claude Haiku 5.5" : "Gemini";
   const romanizeKey =
     provider === "claude"
       ? localStorage.getItem("anthropicKey")
@@ -1076,7 +1076,7 @@ processBtn.addEventListener("click", async () => {
     showError(
       provider === "claude"
         ? "Your Anthropic API key is missing. Please open Settings and add it, or switch \u201cRomanize with\u201d back to Gemini."
-        : "Your Gemini API key is missing. Please open Settings and add it, or switch \u201cRomanize with\u201d to Claude Sonnet 5."
+        : "Your Gemini API key is missing. Please open Settings and add it, or switch \u201cRomanize with\u201d to Claude Haiku 5.5."
     );
     openModal();
     return;
