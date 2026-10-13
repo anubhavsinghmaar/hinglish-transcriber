@@ -670,7 +670,7 @@ function mergeChunkedTranscripts(results, { dedupeMarginSec = 0.4 } = {}) {
 // A 3-hour transcript cannot be transliterated in one call: the output is as long as
 // the input and would blow the output-token ceiling. Chunking on speaker-turn
 // boundaries keeps each request well inside the limit.
-const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_MODEL = "gemini-3.8-flash";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 const MAX_CHUNK_CHARS = 8000;
 
@@ -765,7 +765,7 @@ async function callInteractions(chunk, key, systemPrompt, onRetryWait, gate) {
     input: chunk,
     system_instruction: systemPrompt,
     generation_config: {
-      thinking_level: "minimal", // 3.6-flash defaults to "medium"; thinking eats the output budget
+      thinking_level: "low", // 3.8-flash has no "minimal" (400s) and defaults to "medium"; thinking eats the output budget
       max_output_tokens: 32768,
       seed: 7, // the Interactions API has no temperature
     },
